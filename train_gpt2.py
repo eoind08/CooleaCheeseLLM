@@ -26,27 +26,21 @@ class CausalSelfAttention(nn.Module):
                                       .view(1, 1, config.block_size, config.block_size))
  
      def forward(self, x):
-         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-         # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
-         # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
-         qkv = self.c_attn(x)
-         q, k, v = qkv.split(self.n_embd, dim=2)
-         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-         # attention (materializes the large (T,T) matrix for all the queries and keys)
-
-         #att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-         #att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-         #att = F.softmax(att, dim=-1)
-         #y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-         y = F.scaled_dot_product_attention(q,k,v, is_causal=True)
-
-         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-         # output projection
-         y = self.c_proj(y)
-         return y
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
+        # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # attention (materializes the large (T,T) matrix for all the queries and keys)
+        y = F.scaled_dot_product_attention(q,k,v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        # output projection
+        y = self.c_proj(y)
+        return y
 
 class MLP(nn.Module):
  
@@ -85,9 +79,9 @@ class Block(nn.Module):
 class GPTConfig:
   block_size: int = 1024 # max sequence length
   vocab_size: int = 50257 # number of tokens: 50000 BPE merges + 256 byte tokens + 1 <|endoftext> token
-  n_layer: int = 6 # number of layers
-  n_head: int = 6 # number of heads
-  n_embd: int = 384 # embedding dimensions
+  n_layer: int = 12 # number of layers
+  n_head: int = 12 # number of heads
+  n_embd: int = 768 # embedding dimensions
 
 class GPT(nn.Module):
 
@@ -259,7 +253,15 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-train_loader = DataLoaderLite(B=8, T=1024)
+total_batch_size = 524288 # 2**19 ~0.5M in tokens
+B = 8
+T = 1024
+assert total_batch_size % (B*T) == 0, "make sure total_batch_size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total desired batch size: {total_batch_size}")
+print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T)
 
 torch.set_float32_matmul_precision('high')
 
@@ -286,16 +288,19 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 # optimizer
-#optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 optimizer = model.configure_optimizers(weight_decay = 0.1, learning_rate = 6e-4, device=device)
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.float16):
-        logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.float16):
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # determine and set the learning rate for this iteration
     lr = get_lr(step)
@@ -305,8 +310,9 @@ for step in range(max_steps):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = t1-t0 # difference in miliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {step:4d} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_per_sec = tokens_processed / dt
+    print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
