@@ -75,9 +75,9 @@ class Block(nn.Module):
 class GPTConfig:
     block_size: int = 1024 # max sequence length
     vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
-    n_layer: int = 6 # number of layers
-    n_head: int = 6 # number of heads
-    n_embd: int = 384 # embedding dimension
+    n_layer: int = 12 # number of layers
+    n_head: int = 8 # number of heads
+    n_embd: int = 512 # embedding dimension
 
 class GPT(nn.Module):
 
@@ -209,6 +209,7 @@ import tiktoken
 import numpy as np
 
 def load_tokens(filename):
+    print(f"\nLOADING SHARD: {filename}")
     npt = np.load(filename)
     ptt = torch.tensor(npt, dtype=torch.long)
     return ptt
@@ -323,14 +324,18 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
-total_batch_size = 32768 # 2**19, ~0.5M, in number of tokens
+
+print(device)
+total_batch_size = 131072
 B = 8 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+tokens_per_step = total_batch_size
 if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+    print(f"tokens per optimizer step: {tokens_per_step:,}")
 
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
 val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
@@ -345,10 +350,10 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
-max_lr = 1.8e-3
-min_lr = max_lr * 0.1
-warmup_steps = 715
-max_steps = 19073
+max_lr = 8e-4
+min_lr = 8e-5
+warmup_steps = 500
+max_steps = 20000
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -363,7 +368,7 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 # optimize!
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=1.8e-3, device=device_type)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device_type)
 
 # create the log directory we will write checkpoints to and log to
 log_dir = "log"
@@ -372,12 +377,15 @@ log_file = os.path.join(log_dir, f"log.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
     pass
 
+def get_shard_progress(loader):
+    return loader.current_position / len(loader.tokens)
+
 for step in range(max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
     # once in a while evaluate our validation loss
-    if step % 250 == 0 or last_step:
+    if step % 1000 == 0 or last_step:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
@@ -396,21 +404,24 @@ for step in range(max_steps):
             print(f"validation loss: {val_loss_accum.item():.4f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
-            if step > 0 and (step % 5000 == 0 or last_step):
+            if step > 0 and (step % 2500 == 0 or last_step):
                 # optionally write model checkpoints
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                fullsave_path = os.path.join(log_dir, f"model_{step:05d}_full.pt")
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'config': raw_model.config,
                     'step': step,
                     'val_loss': val_loss_accum.item()
                 }
+                torch.save(raw_model, fullsave_path )
+                print(f"Saved model to {checkpoint_path}")
                 # you might also want to add optimizer.state_dict() and
                 # rng seeds etc., if you wanted to more exactly resume training
                 torch.save(checkpoint, checkpoint_path)
 
     # once in a while evaluate hellaswag
-    if (step % 250 == 0 or last_step) and (not use_compile):
+    if (step > 0 and step % 2500 == 0 or last_step) and (not use_compile):
         num_correct_norm = 0
         num_total = 0
         for i, example in enumerate(iterate_examples("val")):
@@ -443,7 +454,7 @@ for step in range(max_steps):
                 f.write(f"{step} hella {acc_norm:.4f}\n")
 
     # once in a while generate from the model (except step 0, which is noise)
-    if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
+    if ((step > 0 and step % 500 == 0) or last_step) and (not use_compile):
         model.eval()
         num_return_sequences = 4
         max_length = 32
@@ -513,9 +524,34 @@ for step in range(max_steps):
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
     if master_process:
-        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        cumulative_tokens = (step + 1) * total_batch_size
+        shard_progress = train_loader.current_position / len(train_loader.tokens)
+
+        log_line = (
+            f"step {step + 1:6d} | "
+            f"shard {train_loader.current_shard} | "
+            f"shard_progress {shard_progress * 100:6.2f}% | "
+            f"tokens {cumulative_tokens / 1e6:9.2f}M | "
+            f"loss {loss_accum.item():.6f} | "
+            f"lr {lr:.4e} | "
+            f"norm {norm:.4f} | "
+            f"tok/sec {tokens_per_sec:.0f} | "
+            f"dt {dt * 1000:.1f}ms"
+        )
+        print(log_line)
+
         with open(log_file, "a") as f:
-            f.write(f"{step} train {loss_accum.item():.6f}\n")
+            f.write(
+                f"{step + 1} train "
+                f"{loss_accum.item():.6f} "
+                f"shard={train_loader.current_shard:4d} "
+                f"shard_progress={shard_progress:.6f} "
+                f"tokens={cumulative_tokens} "
+                f"lr={lr:.8e} "
+                f"norm={norm:.6f} "
+                f"tok_sec={tokens_per_sec:.2f} "
+                f"dt={dt:.6f}\n"
+        )
 
 if ddp:
     destroy_process_group()
